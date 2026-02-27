@@ -6,7 +6,7 @@ Author: Skye Caplan (NASA, SSAI)
 Last updated: 02/26/2026
 
 TODO: 
-- Generalize the grid_data fcn to work for EMIT
+- Figure out better way to get aligned pixels but individual granule boundaries
 """
 # Packages
 import xarray as xr 
@@ -86,7 +86,7 @@ def mask_ds(ds, flag="CLDICE", reverse=False):
         print("l2_flags not recognized as flag variable")
         return ds
 
-def grid_data(src, resolution, dst_crs="epsg:4326", src_crs="epsg:4326", resampling=Resampling.nearest):
+def grid_data(src, resolution=None, dst_transform=None, dst_crs="epsg:4326", src_crs="epsg:4326", resampling=Resampling.nearest):
     """
     Grid a PACE OCI L2 dataset. Makes sure 3D variables are in (Z, Y, X) 
         dimension order, and all variables have spatial dims/crs assigned.
@@ -98,11 +98,24 @@ def grid_data(src, resolution, dst_crs="epsg:4326", src_crs="epsg:4326", resampl
     Returns:
         dst - projected xr dataset
     """
-    # TODO: combine with regrid_data fcn - check for spatial dims, if none, 
-    #   do the following lines, if found, skip
-    if (len(list(src.dims)) == 3) and (list(src.dims)[0] != "wavelength_3d"):
-        src = src.transpose("wavelength_3d", ...)
-    src = src.rio.set_spatial_dims("pixels_per_line", "number_of_lines")
+    # Get names of dims
+    wvl_var, x_dim, y_dim = None, None, None
+    for dim in list(src.dims):
+        if np.all([wvl_var, x_dim, y_dim]):
+            break
+        elif "wave" in dim:
+            wvl_var = dim
+            continue
+        elif ("lon" in dim) or ("pixel" in dim):
+            x_dim = dim
+            continue
+        elif ("lat" in dim) or ("number" in dim):
+            y_dim = dim
+
+    # Transpose if necessary and set spatial dims
+    if (len(list(src.dims)) == 3) and (list(src.dims)[0] != wvl_var):
+        src = src.transpose(wvl_var, ...)
+    src = src.rio.set_spatial_dims(x_dim, y_dim)
     src = src.rio.write_crs(src_crs)
 
     # Calculating the default affine transform
@@ -111,64 +124,44 @@ def grid_data(src, resolution, dst_crs="epsg:4326", src_crs="epsg:4326", resampl
         dst_crs,
         src.rio.width,
         src.rio.height,
-        left=src.attrs["geospatial_lon_min"],#left=np.nanmin(src.longitude.data),
-        bottom=src.attrs["geospatial_lat_min"],#bottom=np.nanmin(src.latitude.data),
-        right=src.attrs["geospatial_lon_max"],#right=np.nanmax(src.longitude.data),
-        top=src.attrs["geospatial_lat_max"],#top=np.nanmax(src.latitude.data),
+        left=np.nanmin(src["longitude"].data), 
+        bottom=np.nanmin(src["latitude"].data),
+        right=np.nanmax(src["longitude"].data),
+        top=np.nanmax(src["latitude"].data),   
     )
     
-    # Aligning that transform to our desired resolution
+    # Aligning that transform to our desired resolution using either supplied 
+    #    transform or resolution
+    if dst_transform is not None:
+        # If we have a transform, overwrite any given resolution
+        resolution = (dst_transform[0],-1*dst_transform[4])
+
     transform, width, height = rasterio.warp.aligned_target(*defaults, resolution)
     
-    dst = src.rio.reproject(
-        dst_crs=dst_crs,
-        shape=(height, width),
-        transform=transform,
-        src_geoloc_array=(
-            src["longitude"],
-            src["latitude"],
-        ),
-        nodata=np.nan,
-        resample=resampling,
-    )
-    dst["x"] = dst["x"].round(9)
-    dst["y"] = dst["y"].round(9)
-    
-    return dst.rename({"x":"longitude", "y":"latitude"})
+    # If lat/lon arrays are 2D, grid the data using geoloc arrays
+    if len(src["latitude"].dims) > 1:
+        dst = src.rio.reproject(
+            dst_crs=dst_crs,
+            shape=(height, width),
+            transform=transform,
+            src_geoloc_array=(
+                src["longitude"],
+                src["latitude"],
+            ),
+            nodata=np.nan,
+            resample=resampling,
+        )
+    # Else if 1D geoloc arrays, check for user-supplied transform and use it if so
+    else:
+        if dst_transform is not None:
+            transform=dst_transform
+        dst = src.rio.reproject(
+            dst_crs=dst_crs,
+            shape=(height, width),
+            transform=transform,
+            nodata=np.nan,
+        )
 
-def regrid_data(src, resolution, dst_crs="epsg:4326", resampling=Resampling.nearest):
-    """
-    Reproject a dataset to match an input grid. Makes sure 3D variables are
-        in (Z, Y, X) dimension order, and all variables have spatial dims/crs 
-        assigned.
-    Args:
-        src - an xarray dataset or dataarray to reproject
-        resolution - resolution of the output grid, in dst_crs units
-        dst_crs - CRS of the output data
-        resampling - resampling method (see rasterio.enums)
-    Returns:
-        dst - projected xr dataset
-    """
-    # TODO: Generalize
-    if (len(list(src.dims)) == 3) and ((list(src.dims)[0] != "wavelengths") or (list(src.dims)[0] != "wavelength_3d")):
-        try:
-            src = src.transpose("wavelengths", ...)
-        except:
-            src = src.transpose("wavelength_3d", ...)
-
-    # Aligning that transform to our desired resolution
-    transform, width, height = rasterio.warp.aligned_target(transform=src.rio.transform(), 
-                                                            width=src.rio.width, 
-                                                            height=src.rio.height,
-                                                            resolution=resolution)
-    
-    dst = src.rio.reproject(
-        dst_crs=dst_crs,
-        shape=(height, width),
-        transform=transform,
-        nodata=np.nan,
-        resample=resampling,
-    )
     dst["x"] = dst["x"].round(9)
     dst["y"] = dst["y"].round(9)
     
